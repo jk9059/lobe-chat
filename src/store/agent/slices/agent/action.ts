@@ -14,7 +14,6 @@ import { agentService } from '@/services/agent';
 import {
   agentDocumentService,
   agentDocumentSWRKeys,
-  mapAgentDocumentsToContext,
   resolveAgentDocumentsContext,
 } from '@/services/agentDocument';
 import type { StoreSetter } from '@/store/types';
@@ -26,6 +25,7 @@ import type {
   LobeAgentConfig,
   RuntimeEnvConfig,
 } from '@/types/agent';
+import { toAgentContextDocuments } from '@/utils/agentDocumentContextMapping';
 import { merge } from '@/utils/merge';
 
 import type { AgentStore } from '../../store';
@@ -227,6 +227,13 @@ export class AgentSliceActionImpl {
 
     if (isDesktop && 'workingDirectory' in config) {
       setLocalAgentWorkingDirectory(agentId, config.workingDirectory);
+      const nextMap = { ...this.#get().localAgentWorkingDirectoryMap };
+      if (config.workingDirectory) {
+        nextMap[agentId] = config.workingDirectory;
+      } else {
+        delete nextMap[agentId];
+      }
+      this.#set({ localAgentWorkingDirectoryMap: nextMap }, false, 'updateAgentWorkingDirectory');
     }
 
     const restConfig = { ...config };
@@ -290,11 +297,35 @@ export class AgentSliceActionImpl {
     );
   };
 
+  useHydrateAgentConfig = (
+    isLogin: boolean | undefined,
+    agentId: string,
+  ): SWRResponse<LobeAgentConfig> => {
+    const swrKey =
+      isLogin === true && agentId && !isChatGroupSessionId(agentId)
+        ? ([FETCH_AGENT_CONFIG_KEY, agentId] as const)
+        : null;
+
+    return useClientDataSWRWithSync<LobeAgentConfig>(
+      swrKey,
+      async () => {
+        const data = await agentService.getAgentConfigById(agentId);
+        return data as LobeAgentConfig;
+      },
+      {
+        onData: (data) => {
+          if (!data) return;
+          this.#get().internal_dispatchAgentMap(agentId, data);
+        },
+      },
+    );
+  };
+
   useFetchAgentDocuments = (agentId?: string | null): SWRResponse<AgentContextDocument[]> => {
     return useClientDataSWRWithSync<AgentContextDocument[]>(
       agentId ? agentDocumentSWRKeys.documents(agentId) : null,
       async () =>
-        mapAgentDocumentsToContext(await agentDocumentService.getDocuments({ agentId: agentId! })),
+        toAgentContextDocuments(await agentDocumentService.getDocuments({ agentId: agentId! })),
       {
         onData: (data) => {
           if (!agentId) return;

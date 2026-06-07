@@ -1,3 +1,4 @@
+import type { BriefArtifacts, BriefMetadata } from '@lobechat/types';
 import {
   foreignKey,
   index,
@@ -51,6 +52,10 @@ export const tasks = pgTable(
     name: text('name'),
     description: varchar255('description'),
     instruction: text('instruction').notNull(),
+    // Rich editor JSON state (Lexical). Mirrors the markdown `instruction`
+    // but preserves details that markdown drops — image sizes, custom nodes, etc.
+    // Optional: when null, callers fall back to parsing `instruction` markdown.
+    editorData: jsonb('editor_data'),
 
     // Lifecycle (same state machine for user and agent)
     // 'backlog' | 'running' | 'paused' | 'completed' | 'failed' | 'canceled'
@@ -241,7 +246,7 @@ export const briefs = pgTable(
     priority: text('priority').default('info'), // 'urgent' | 'normal' | 'info'
     title: text('title').notNull(),
     summary: text('summary').notNull(),
-    artifacts: jsonb('artifacts'), // document ids
+    artifacts: jsonb('artifacts').$type<BriefArtifacts>(), // programmatically collected at synthesis
     actions: jsonb('actions'), // BriefAction[]
 
     // Resolution
@@ -251,7 +256,7 @@ export const briefs = pgTable(
     resolvedAt: timestamptz('resolved_at'),
 
     trigger: varchar255('trigger'), // field for which module triggered the brief, e.g. task, agent, signal, etc.
-    metadata: jsonb('metadata'), // freeform field for business and states.
+    metadata: jsonb('metadata').$type<BriefMetadata>(), // freeform field for business and states.
 
     createdAt: createdAt(),
   },

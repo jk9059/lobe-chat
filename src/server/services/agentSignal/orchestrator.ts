@@ -7,30 +7,31 @@ import type {
   GeneratedSourceEventResult,
   SignalPlan,
 } from '@lobechat/agent-signal';
+import type { AgentSignalSourceType } from '@lobechat/agent-signal/source';
+import { createSourceEvent } from '@lobechat/agent-signal/source';
 
-import {
-  type AgentSignalEmitOptions,
-  type AgentSignalExecutionContext,
-  type AgentSignalSourceEnvelope,
-  type AgentSignalSourceEventInput,
-  resolveSourceScopeKey,
+import type {
+  AgentSignalEmitOptions,
+  AgentSignalExecutionContext,
+  AgentSignalSourceEventInput,
 } from './emitter';
 import { projectAgentSignalObservability } from './observability/projector';
 import { persistAgentSignalObservability } from './observability/store';
-import {
-  createDefaultAgentSignalPolicies,
-  type CreateDefaultAgentSignalPoliciesOptions,
-} from './policies';
+import type { CreateDefaultAgentSignalPoliciesOptions } from './policies';
+import { createDefaultAgentSignalPolicies } from './policies';
+import { createProcedurePolicyOptions } from './procedure';
 import type { RuntimeGuardBackend } from './runtime/AgentSignalRuntime';
 import { createAgentSignalRuntime } from './runtime/AgentSignalRuntime';
+import { persistAgentSignalReceipts, projectAgentSignalReceipts } from './services/receiptService';
+import { createSelfIterationCompletionHandler } from './services/selfIteration/completion';
 import { emitSourceEvent } from './sources';
-import type { AgentSignalSourceType } from './sourceTypes';
-import type { AgentSignalSourceEventStore } from './store/types';
+import { redisPolicyStateStore } from './store/adapters/redis/policyStateStore';
+import type { AgentSignalReceiptStore, AgentSignalSourceEventStore } from './store/types';
 
 export { createAgentSignalRuntime } from './runtime/AgentSignalRuntime';
 
 interface ExecuteAgentSignalSourceEventOptions extends AgentSignalEmitOptions {
-  policyOptions?: Partial<CreateDefaultAgentSignalPoliciesOptions>;
+  receiptStore?: AgentSignalReceiptStore;
   runtimeGuardBackend?: RuntimeGuardBackend;
   store?: AgentSignalSourceEventStore;
 }
@@ -90,19 +91,63 @@ const buildRuntimeOrchestrationResult = (
   };
 };
 
+const createPolicyOptions = (
+  context: AgentSignalExecutionContext,
+  options: ExecuteAgentSignalSourceEventOptions,
+  procedurePolicyOptions: NonNullable<CreateDefaultAgentSignalPoliciesOptions['procedure']>,
+): CreateDefaultAgentSignalPoliciesOptions => {
+  // Nightly review writes its Daily Brief in-run via the builtin review
+  // serverRuntime primitive, so the orchestrator no longer injects a brief
+  // writer default.
+  const policyOptions = options.policyOptions;
+
+  return {
+    completion: {
+      onSelfIterationCompleted: createSelfIterationCompletionHandler(
+        options.receiptStore ? { receiptStore: options.receiptStore } : {},
+      ),
+    },
+    feedbackDomainJudge: {
+      db: context.db,
+      ...policyOptions?.feedbackDomainJudge,
+      userId: context.userId,
+    },
+    feedbackSatisfactionJudge: {
+      db: context.db,
+      ...policyOptions?.feedbackSatisfactionJudge,
+      userId: context.userId,
+    },
+    classifierDiagnostics: policyOptions?.classifierDiagnostics,
+    nightlyReview: policyOptions?.nightlyReview,
+    procedure: procedurePolicyOptions,
+    selfFeedbackIntent: policyOptions?.selfFeedbackIntent,
+    selfReflection: policyOptions?.selfReflection,
+    userMemory: {
+      db: context.db,
+      ...policyOptions?.userMemory,
+      userId: context.userId,
+    },
+    skillManagement: {
+      db: context.db,
+      ...policyOptions?.skillManagement,
+      selfIterationEnabled: policyOptions?.skillManagement?.selfIterationEnabled ?? false,
+      userId: context.userId,
+    },
+    skillIntentClassifier: {
+      db: context.db,
+      ...policyOptions?.skillIntentClassifier,
+      userId: context.userId,
+    },
+  };
+};
+
 const executeAgentSignalSourceEventCore = async <TSourceType extends AgentSignalSourceType>(
   input: AgentSignalSourceEventInput<TSourceType>,
   context: AgentSignalExecutionContext,
   options: ExecuteAgentSignalSourceEventOptions = {},
 ): Promise<DedupedSourceEventResult | GeneratedAgentSignalEmissionResult | undefined> => {
   try {
-    const sourceEvent: AgentSignalSourceEnvelope = {
-      payload: input.payload,
-      scopeKey: input.scopeKey ?? resolveSourceScopeKey(input.payload),
-      sourceId: input.sourceId,
-      sourceType: input.sourceType,
-      timestamp: input.timestamp ?? Date.now(),
-    };
+    const sourceEvent = createSourceEvent(input);
 
     const emission = await emitSourceEvent(
       sourceEvent,
@@ -110,30 +155,30 @@ const executeAgentSignalSourceEventCore = async <TSourceType extends AgentSignal
     );
     if (emission.deduped) return emission;
 
+    const procedurePolicyOptions =
+      options.policyOptions?.procedure ??
+      createProcedurePolicyOptions({
+        policyStateStore: redisPolicyStateStore,
+        ttlSeconds: 7 * 24 * 60 * 60,
+      });
+
     const runtime = await createAgentSignalRuntime({
       guardBackend: options.runtimeGuardBackend,
-      policies: createDefaultAgentSignalPolicies({
-        feedbackDomainJudge: {
-          db: context.db,
-          ...options.policyOptions?.feedbackDomainJudge,
-          userId: context.userId,
-        },
-        feedbackSatisfactionJudge: {
-          db: context.db,
-          ...options.policyOptions?.feedbackSatisfactionJudge,
-          userId: context.userId,
-        },
-        userMemory: {
-          db: context.db,
-          ...options.policyOptions?.userMemory,
-          userId: context.userId,
-        },
-      }),
+      policies: createDefaultAgentSignalPolicies(
+        createPolicyOptions(context, options, procedurePolicyOptions),
+      ),
     });
     const runtimeResult = await runtime.emitNormalized(emission.source);
     const orchestration = buildRuntimeOrchestrationResult(emission.source, runtimeResult);
 
     await persistAgentSignalObservability(orchestration.observability);
+    const receipts = projectAgentSignalReceipts({
+      actions: orchestration.actions,
+      results: orchestration.results,
+      source: emission.source,
+      userId: context.userId,
+    });
+    await persistAgentSignalReceipts(receipts, { store: options.receiptStore });
 
     return {
       ...emission,
@@ -172,7 +217,7 @@ export const executeAgentSignalSourceEvent = async <TSourceType extends AgentSig
  * Emits one source event using an injected store for eval and test coverage.
  *
  * Use when:
- * - The caller needs the exact production orchestration path but with isolated in-memory dedupe state
+ * - The caller needs the exact  server orchestration path but with isolated in-memory dedupe state
  * - Eval or test code must avoid ambient Redis dependencies
  *
  * Expects:

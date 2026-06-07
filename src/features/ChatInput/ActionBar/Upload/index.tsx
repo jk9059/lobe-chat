@@ -13,7 +13,7 @@ import FileIcon from '@/components/FileIcon';
 import RepoIcon from '@/components/LibIcon';
 import TipGuide from '@/components/TipGuide';
 import { openAttachKnowledgeModal } from '@/features/LibraryModal';
-import { useModelSupportVision } from '@/hooks/useModelSupportVision';
+import { useVisualMediaUploadAbility } from '@/hooks/useVisualMediaUploadAbility';
 import { useAgentStore } from '@/store/agent';
 import { agentByIdSelectors } from '@/store/agent/selectors';
 import { useFileStore } from '@/store/file';
@@ -22,6 +22,7 @@ import { useUserStore } from '@/store/user';
 import { preferenceSelectors } from '@/store/user/selectors';
 
 import { useAgentId } from '../../hooks/useAgentId';
+import { useChatInputStore } from '../../store';
 import Action from '../components/Action';
 import { type ActionDropdownMenuItems } from '../components/ActionDropdown';
 import CheckboxItem from '../components/CheckboxWithLoading';
@@ -43,12 +44,13 @@ const FileUpload = memo(() => {
   );
 
   const upload = useFileStore((s) => s.uploadChatFiles);
+  const editor = useChatInputStore((s) => s.editor);
 
   const agentId = useAgentId();
   const model = useAgentStore((s) => agentByIdSelectors.getAgentModelById(agentId)(s));
   const provider = useAgentStore((s) => agentByIdSelectors.getAgentModelProviderById(agentId)(s));
 
-  const canUploadImage = useModelSupportVision(model, provider);
+  const { canUploadImage, canUploadVideo } = useVisualMediaUploadAbility(model, provider);
 
   const [showTip, updateGuideState] = useUserStore((s) => [
     preferenceSelectors.showUploadFileInKnowledgeBaseTip(s),
@@ -83,6 +85,7 @@ const FileUpload = memo(() => {
           showUploadList={false}
           beforeUpload={async (file) => {
             setDropdownOpen(false);
+            editor?.focus();
             await upload([file]);
 
             return false;
@@ -105,7 +108,10 @@ const FileUpload = memo(() => {
           multiple
           showUploadList={false}
           beforeUpload={async (file) => {
-            if (!canUploadImage && (file.type.startsWith('image') || file.type.startsWith('video')))
+            if (
+              (file.type.startsWith('image') && !canUploadImage) ||
+              (file.type.startsWith('video') && !canUploadVideo)
+            )
               return false;
 
             // Validate video file size
@@ -120,6 +126,7 @@ const FileUpload = memo(() => {
             }
 
             setDropdownOpen(false);
+            editor?.focus();
             await upload([file]);
 
             return false;
@@ -139,7 +146,10 @@ const FileUpload = memo(() => {
           multiple={true}
           showUploadList={false}
           beforeUpload={async (file) => {
-            if (!canUploadImage && (file.type.startsWith('image') || file.type.startsWith('video')))
+            if (
+              (file.type.startsWith('image') && !canUploadImage) ||
+              (file.type.startsWith('video') && !canUploadVideo)
+            )
               return false;
 
             // Validate video file size
@@ -154,6 +164,7 @@ const FileUpload = memo(() => {
             }
 
             setDropdownOpen(false);
+            editor?.focus();
             await upload([file]);
 
             return false;

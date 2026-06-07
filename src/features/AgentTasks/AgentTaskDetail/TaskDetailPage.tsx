@@ -1,17 +1,23 @@
-import { Flexbox } from '@lobehub/ui';
+import { Button, Flexbox } from '@lobehub/ui';
 import { memo, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router-dom';
 
+import NotFound from '@/components/404';
 import AutoSaveHint from '@/components/Editor/AutoSaveHint';
 import Loading from '@/components/Loading/BrandTextLoading';
+import DocumentPreviewModal from '@/features/DocumentModal/Preview';
 import NavHeader from '@/features/NavHeader';
 import ToggleRightPanelButton from '@/features/RightPanel/ToggleRightPanelButton';
 import WideScreenContainer from '@/features/WideScreenContainer';
-import { useChatStore } from '@/store/chat';
+import { useGlobalStore } from '@/store/global';
+import { systemStatusSelectors } from '@/store/global/selectors';
 import { useTaskStore } from '@/store/task';
 import { taskDetailSelectors } from '@/store/task/selectors';
 
 import Breadcrumb from '../shared/Breadcrumb';
 import TaskActivities from './TaskActivities';
+import TaskArtifacts from './TaskArtifacts';
 import TaskDetailAssignee from './TaskDetailAssignee';
 import TaskDetailHeaderActions from './TaskDetailHeaderActions';
 import TaskDetailRunPauseAction from './TaskDetailRunPauseAction';
@@ -24,46 +30,74 @@ import TaskSubtasks from './TaskSubtasks';
 import TopicChatDrawer from './TopicChatDrawer';
 
 interface TaskDetailPageProps {
-  agentId?: string;
+  showTaskAgentPanelToggle?: boolean;
   taskId: string;
 }
 
-const TaskDetailPage = memo<TaskDetailPageProps>(({ agentId, taskId }) => {
+const TaskDetailPage = memo<TaskDetailPageProps>(({ taskId, showTaskAgentPanelToggle = true }) => {
+  const { t } = useTranslation('chat');
   const setActiveTaskId = useTaskStore((s) => s.setActiveTaskId);
   const useFetchTaskDetail = useTaskStore((s) => s.useFetchTaskDetail);
-  const isLoading = useTaskStore(taskDetailSelectors.isTaskDetailLoading);
   const saveStatus = useTaskStore(taskDetailSelectors.taskSaveStatus);
+  const hasTaskDetail = useTaskStore((s) => !!s.taskDetailMap[taskId]);
+  const [showTaskAgentPanel, toggleTaskAgentPanel] = useGlobalStore((s) => [
+    systemStatusSelectors.showTaskAgentPanel(s),
+    s.toggleTaskAgentPanel,
+  ]);
 
   useEffect(() => {
     setActiveTaskId(taskId);
     return () => setActiveTaskId(undefined);
   }, [taskId, setActiveTaskId]);
 
-  // Sync the task's assignee agent into chat store so the right-side
-  // AgentTaskManager conversation knows which agent to talk to.
-  useEffect(() => {
-    if (!agentId) return;
-    useChatStore.setState({ activeAgentId: agentId }, false, 'TaskDetailPage/syncAgentId');
-    return () => {
-      const current = useChatStore.getState().activeAgentId;
-      if (current === agentId) {
-        useChatStore.setState({ activeAgentId: undefined }, false, 'TaskDetailPage/clearAgentId');
-      }
-    };
-  }, [agentId]);
+  const { isLoading } = useFetchTaskDetail(taskId);
 
-  useFetchTaskDetail(taskId);
+  const isInitialLoading = isLoading && !hasTaskDetail;
+  // Only treat as not-found when there is no cached detail and the initial fetch
+  // has settled. A transient revalidation error (focus/reconnect/poll/5xx) must not
+  // hide an already-loaded task behind the 404 fallback.
+  const isNotFound = !isLoading && !hasTaskDetail;
+
+  if (isNotFound) {
+    return (
+      <Flexbox flex={1} height={'100%'} style={{ minHeight: 0 }}>
+        <NavHeader
+          left={<Breadcrumb taskId={taskId} />}
+          styles={{ left: { paddingLeft: 4, gap: 8 } }}
+        />
+        <Flexbox flex={1} style={{ minHeight: 0, overflowY: 'auto' }}>
+          <NotFound
+            desc={t('taskDetail.notFound.desc')}
+            title={t('taskDetail.notFound.title')}
+            extra={
+              <Link to={'/tasks'}>
+                <Button type={'primary'}>{t('taskDetail.notFound.backToTasks')}</Button>
+              </Link>
+            }
+          />
+        </Flexbox>
+      </Flexbox>
+    );
+  }
 
   return (
     <Flexbox flex={1} height={'100%'} style={{ minHeight: 0 }}>
       <NavHeader
-        right={<ToggleRightPanelButton hideWhenExpanded />}
         left={
           <>
             <Breadcrumb taskId={taskId} />
             <TaskDetailHeaderActions />
             {saveStatus === 'saving' ? <AutoSaveHint saveStatus={saveStatus} /> : undefined}
           </>
+        }
+        right={
+          showTaskAgentPanelToggle ? (
+            <ToggleRightPanelButton
+              hideWhenExpanded
+              expand={showTaskAgentPanel}
+              onToggle={() => toggleTaskAgentPanel()}
+            />
+          ) : undefined
         }
         styles={{
           left: {
@@ -74,7 +108,7 @@ const TaskDetailPage = memo<TaskDetailPageProps>(({ agentId, taskId }) => {
       />
       <Flexbox flex={1} style={{ minHeight: 0, overflowY: 'auto' }}>
         <WideScreenContainer>
-          {isLoading ? (
+          {isInitialLoading ? (
             <Loading debugId="TaskDetail" />
           ) : (
             <>
@@ -95,6 +129,7 @@ const TaskDetailPage = memo<TaskDetailPageProps>(({ agentId, taskId }) => {
               <Flexbox gap={24} style={{ paddingBottom: 120 }}>
                 <TaskInstruction />
                 <TaskSubtasks />
+                <TaskArtifacts />
                 <TaskActivities />
               </Flexbox>
             </>
@@ -102,6 +137,7 @@ const TaskDetailPage = memo<TaskDetailPageProps>(({ agentId, taskId }) => {
         </WideScreenContainer>
       </Flexbox>
       <TopicChatDrawer />
+      <DocumentPreviewModal />
     </Flexbox>
   );
 });

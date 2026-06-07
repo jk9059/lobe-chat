@@ -1,17 +1,24 @@
 // Disable the auto sort key eslint rule to make the code more logic and readable
-import { createCallAgentManifest } from '@lobechat/builtin-tool-agent-management';
+import type { CallAgentParams, CallAgentState } from '@lobechat/builtin-tool-agent-management';
+import {
+  AgentManagementApiName,
+  AgentManagementIdentifier,
+  createCallAgentManifest,
+} from '@lobechat/builtin-tool-agent-management';
 import { ENABLE_BUSINESS_FEATURES } from '@lobechat/business-const';
 import { isDesktop, LOADING_FLAT } from '@lobechat/const';
 import { formatSelectedSkillsContext, formatSelectedToolsContext } from '@lobechat/context-engine';
 import { chainCompressContext } from '@lobechat/prompts';
-import {
-  type ChatImageItem,
-  type ChatThreadType,
-  type ChatVideoItem,
-  type ConversationContext,
-  type SendMessageParams,
-  type SendMessageServerResponse,
-  type UIChatMessage,
+import type {
+  ChatImageItem,
+  ChatThreadType,
+  ChatToolPayload,
+  ChatVideoItem,
+  ConversationContext,
+  MessageMetadata,
+  SendMessageParams,
+  SendMessageServerResponse,
+  UIChatMessage,
 } from '@lobechat/types';
 import { nanoid } from '@lobechat/utils';
 import { TRPCClientError } from '@trpc/client';
@@ -19,15 +26,24 @@ import { t } from 'i18next';
 
 import { markUserValidAction } from '@/business/client/markUserValidAction';
 import { message as antdMessage } from '@/components/AntdStaticMethods';
+import { agentService } from '@/services/agent';
 import { aiChatService } from '@/services/aiChat';
 import { chatService } from '@/services/chat';
 import { resolveSelectedSkillsWithContent } from '@/services/chat/mecha/skillPreload';
 import { resolveSelectedToolsWithContent } from '@/services/chat/mecha/toolPreload';
 import { messageService } from '@/services/message';
-import { getAgentStoreState } from '@/store/agent';
-import { agentByIdSelectors, agentSelectors } from '@/store/agent/selectors';
+import { getAgentStoreState, useAgentStore } from '@/store/agent';
+import {
+  agentByIdSelectors,
+  agentSelectors,
+  chatConfigByIdSelectors,
+} from '@/store/agent/selectors';
 import { agentGroupByIdSelectors, getChatGroupStoreState } from '@/store/agentGroup';
+import { selectRuntimeType } from '@/store/chat/slices/aiChat/actions/agentDispatcher';
 import { resolveHeteroResume } from '@/store/chat/slices/aiChat/actions/heteroResume';
+import { dispatchNonHeteroSubAgent } from '@/store/chat/slices/aiChat/actions/nonHeteroSubAgentDispatcher';
+import { PortalViewType } from '@/store/chat/slices/portal/initialState';
+import { chatPortalSelectors } from '@/store/chat/slices/portal/selectors';
 import { type ChatStore } from '@/store/chat/store';
 import {
   mergeAgentRuntimeInitialContexts,
@@ -38,24 +54,29 @@ import {
   getCompressionCandidateMessageIds,
   hasRunningCompressionOperation,
 } from '@/store/chat/utils/compression';
-import { getFileStoreState } from '@/store/file/store';
 import { useGlobalStore } from '@/store/global';
 import { systemStatusSelectors } from '@/store/global/selectors';
 import { type StoreSetter } from '@/store/types';
 import { useUserMemoryStore } from '@/store/userMemory';
+import { markdownToTxt } from '@/utils/markdownToTxt';
 
 import { dbMessageSelectors, displayMessageSelectors, topicSelectors } from '../../../selectors';
 import { messageMapKey } from '../../../utils/messageMapKey';
-import { AI_RUNTIME_OPERATION_TYPES } from '../../operation/types';
+import { topicMapKey } from '../../../utils/topicMapKey';
+import { AI_RUNTIME_OPERATION_TYPES, type QueuedFile } from '../../operation/types';
+import type { CommandSendOverrides, SingleAgentMentionDirectRoute } from './commandBus';
 import {
-  type CommandSendOverrides,
   hasNonActionContent,
   injectReferTopicNode,
+  mergeLocalFileReferences,
+  parseLocalFileReferencesFromEditorData,
   parseMentionedAgentsFromEditorData,
   parseSelectedSkillsFromEditorData,
   parseSelectedToolsFromEditorData,
+  parseSingleAgentMentionDirectRoute,
   processCommands,
 } from './commandBus';
+import { materializeLocalSystemToolSnapshots } from './localSystemToolSnapshots';
 /**
  * Extended params for sendMessage with context
  */
@@ -109,6 +130,30 @@ const isAbortError = (error: unknown, abortController?: AbortController) =>
 const createAbortError = () =>
   Object.assign(new Error('Compression cancelled'), { name: 'AbortError' });
 
+const attachSendTimeMetadataToUserMessage = (
+  messages: UIChatMessage[],
+  userMessageId: string,
+  metadata: MessageMetadata | undefined,
+): UIChatMessage[] => {
+  if (!metadata) return messages;
+
+  let changed = false;
+  const nextMessages = messages.map((message) => {
+    if (message.id !== userMessageId) return message;
+
+    changed = true;
+    return {
+      ...message,
+      metadata: {
+        ...(message.metadata ?? undefined),
+        ...metadata,
+      },
+    };
+  });
+
+  return changed ? nextMessages : messages;
+};
+
 export class ConversationLifecycleActionImpl {
   readonly #get: () => ChatStore;
 
@@ -118,10 +163,35 @@ export class ConversationLifecycleActionImpl {
     this.#get = get;
   }
 
+  /**
+   * Read the active topic-list filter from `topicDataMap` so it can be
+   * forwarded to `sendMessageInServer`. Without this, the server returns
+   * an unfiltered list which `internal_updateTopics` then writes back over
+   * the filtered sidebar — completed/cron topics reappear until the next
+   * SWR revalidation.
+   */
+  #getTopicFilter = (
+    agentId?: string,
+    groupId?: string,
+  ):
+    | { excludeStatuses?: string[]; excludeTriggers?: string[]; includeTriggers?: string[] }
+    | undefined => {
+    if (!agentId && !groupId) return undefined;
+    const data = this.#get().topicDataMap[topicMapKey({ agentId, groupId })];
+    if (!data) return undefined;
+    const { excludeStatuses, excludeTriggers } = data;
+    if (!excludeStatuses?.length && !excludeTriggers?.length) return undefined;
+    return {
+      ...(excludeStatuses?.length ? { excludeStatuses } : {}),
+      ...(excludeTriggers?.length ? { excludeTriggers } : {}),
+    };
+  };
+
   sendMessage = async ({
     message,
     editorData: inputEditorData,
     files,
+    metadata,
     onlyAddUserMessage,
     context,
     messages: inputMessages,
@@ -130,13 +200,17 @@ export class ConversationLifecycleActionImpl {
     onTopicCreated,
   }: SendMessageWithContextParams): Promise<SendMessageResult | undefined> => {
     let editorData = inputEditorData;
-    const { internal_execAgentRuntime, mainInputEditor } = this.#get();
+    const { executeClientAgent, mainInputEditor } = this.#get();
+    const { agentId } = context;
     const selectedSkills = parseSelectedSkillsFromEditorData(editorData);
     const selectedTools = parseSelectedToolsFromEditorData(editorData);
     const mentionedAgents = parseMentionedAgentsFromEditorData(editorData);
 
+    const localFileReferences = mergeLocalFileReferences(
+      parseLocalFileReferencesFromEditorData(editorData),
+    );
+
     // Use context from params (required)
-    const { agentId } = context;
     // If creating new thread (isNew + scope='thread'), threadId will be created by server
     const isCreatingNewThread = context.isNew && context.scope === 'thread';
     // Build newThread params for server from new context format
@@ -150,6 +224,14 @@ export class ConversationLifecycleActionImpl {
         : undefined;
 
     if (!agentId) return;
+
+    const agentConfig = agentSelectors.getAgentConfigById(agentId)(getAgentStoreState());
+    const heterogeneousProvider = agentConfig?.agencyConfig?.heterogeneousProvider;
+    const runtimeType = selectRuntimeType({
+      executionTarget: agentConfig?.agencyConfig?.executionTarget,
+      heterogeneousProvider,
+      isGatewayMode: this.#get().isGatewayModeEnabled(),
+    });
 
     // ── Command Bus: extract and process built-in commands from editorData ──
     const commandOverrides: CommandSendOverrides = processCommands({
@@ -206,7 +288,11 @@ export class ConversationLifecycleActionImpl {
       isGroupSupervisor = group?.supervisorAgentId === agentId;
     }
     // In non-group context, @agent mentions make the current agent act as supervisor
-    const hasMentionedAgents = !context.groupId && mentionedAgents.length > 0;
+    const directMentionRoute = !context.groupId
+      ? parseSingleAgentMentionDirectRoute(editorData)
+      : undefined;
+    const hasMentionedAgents =
+      !context.groupId && !directMentionRoute && mentionedAgents.length > 0;
 
     const operationContext = {
       ...context,
@@ -217,6 +303,24 @@ export class ConversationLifecycleActionImpl {
     };
 
     const fileIdList = files?.map((f) => f.id);
+    const isLocalSystemEnabled =
+      chatConfigByIdSelectors.isLocalSystemEnabledById(agentId)(getAgentStoreState());
+    const canMaterializeLocalFiles =
+      isDesktop &&
+      localFileReferences.length > 0 &&
+      !metadata?.localSystemToolSnapshots?.length &&
+      (!!heterogeneousProvider || isLocalSystemEnabled);
+    const localSystemToolSnapshots = canMaterializeLocalFiles
+      ? await materializeLocalSystemToolSnapshots(localFileReferences)
+      : [];
+    const userMessageMetadata =
+      metadata || pageSelections?.length || localSystemToolSnapshots.length
+        ? {
+            ...metadata,
+            ...(pageSelections?.length ? { pageSelections } : undefined),
+            ...(localSystemToolSnapshots.length ? { localSystemToolSnapshots } : undefined),
+          }
+        : undefined;
 
     // Enrich selected skills/tools with preloaded content, injected directly
     // via SelectedSkillInjector/SelectedToolInjector — no fake tool-call preload messages
@@ -228,6 +332,8 @@ export class ConversationLifecycleActionImpl {
       message,
       selectedTools,
     });
+    const requestTrigger = (metadata as Pick<MessageMetadata, 'trigger'> | undefined)?.trigger;
+    const requestMetadata = requestTrigger ? { trigger: requestTrigger } : undefined;
 
     const hasFile = !!fileIdList && fileIdList.length > 0;
 
@@ -247,6 +353,16 @@ export class ConversationLifecycleActionImpl {
       .find((op) => op && AI_RUNTIME_OPERATION_TYPES.includes(op.type) && op.status === 'running');
 
     if (runningAgentOp) {
+      // Snapshot file previews so the tray can render thumbnails AND the
+      // resumed sendMessage can rebuild imageList/videoList — by the time
+      // we drain, chatUploadFileList has long been cleared.
+      const filesPreview: QueuedFile[] = (files ?? []).map((f) => ({
+        id: f.id,
+        mimeType: f.file?.type ?? '',
+        name: f.file?.name ?? f.id,
+        url: f.fileUrl || f.base64Url || f.previewUrl || '',
+      }));
+
       this.#get().enqueueMessage(
         currentContextKey,
         {
@@ -254,7 +370,9 @@ export class ConversationLifecycleActionImpl {
           content: message,
           editorData: editorData ?? undefined,
           files: fileIdList,
+          filesPreview: filesPreview.length > 0 ? filesPreview : undefined,
           interruptMode: 'soft',
+          metadata: userMessageMetadata,
           createdAt: Date.now(),
         },
         runningAgentOp.id,
@@ -302,16 +420,18 @@ export class ConversationLifecycleActionImpl {
       },
     });
 
-    // Construct local media preview for server-mode temporary messages (S3 URL takes priority)
-    const filesInStore = getFileStoreState().chatUploadFileList;
-    const tempImages: ChatImageItem[] = filesInStore
+    // Construct local media preview for server-mode temporary messages (S3 URL takes priority).
+    // Use the captured `files` param (not the global file store) so the optimistic preview
+    // also works on the queue-drain path, where chatUploadFileList has already been cleared.
+    const filesForPreview = files ?? [];
+    const tempImages: ChatImageItem[] = filesForPreview
       .filter((f) => f.file?.type?.startsWith('image'))
       .map((f) => ({
         id: f.id,
         url: f.fileUrl || f.base64Url || f.previewUrl || '',
         alt: f.file?.name || f.id,
       }));
-    const tempVideos: ChatVideoItem[] = filesInStore
+    const tempVideos: ChatVideoItem[] = filesForPreview
       .filter((f) => f.file?.type?.startsWith('video'))
       .map((f) => ({
         id: f.id,
@@ -333,8 +453,8 @@ export class ConversationLifecycleActionImpl {
         threadId: operationContext.threadId ?? undefined,
         imageList: tempImages.length > 0 ? tempImages : undefined,
         videoList: tempVideos.length > 0 ? tempVideos : undefined,
-        // Pass pageSelections metadata for immediate display
-        metadata: pageSelections?.length ? { pageSelections } : undefined,
+        // Pass metadata for immediate display
+        metadata: userMessageMetadata,
       },
       { operationId, tempMessageId: tempId },
     );
@@ -365,9 +485,7 @@ export class ConversationLifecycleActionImpl {
 
     // ── External agent mode: delegate to heterogeneous agent CLI (desktop only) ──
     // Per-agent heterogeneousProvider config takes priority over the global gateway mode.
-    const agentConfig = agentSelectors.getAgentConfigById(agentId)(getAgentStoreState());
-    const heterogeneousProvider = agentConfig?.agencyConfig?.heterogeneousProvider;
-    if (isDesktop && heterogeneousProvider) {
+    if (runtimeType === 'hetero' && heterogeneousProvider) {
       // Resolve cwd up-front so the new topic is bound to a project at
       // creation time. Otherwise the row stays NULL until the post-execution
       // metadata write — which never lands on cancel/error and meanwhile
@@ -399,7 +517,7 @@ export class ConversationLifecycleActionImpl {
             newTopic: !operationContext.topicId
               ? {
                   metadata: workingDirectory ? { workingDirectory } : undefined,
-                  title: message.slice(0, 20) || t('defaultTitle', { ns: 'topic' }),
+                  title: markdownToTxt(message).slice(0, 80) || t('defaultTitle', { ns: 'topic' }),
                   topicMessageIds: messages.map((m) => m.id),
                 }
               : undefined,
@@ -407,10 +525,16 @@ export class ConversationLifecycleActionImpl {
               content: message,
               editorData,
               files: fileIdList,
+              metadata: userMessageMetadata,
               pageSelections,
               parentId,
             },
             threadId: operationContext.threadId ?? undefined,
+            topicFilter: this.#getTopicFilter(
+              operationContext.agentId,
+              operationContext.groupId ?? undefined,
+            ),
+            topicPageSize: systemStatusSelectors.topicPageSize(useGlobalStore.getState()),
             topicId: operationContext.topicId ?? undefined,
           },
           abortController,
@@ -533,14 +657,19 @@ export class ConversationLifecycleActionImpl {
     }
 
     // ── Gateway mode: skip sendMessageInServer, let execAgentTask handle everything ──
-    if (this.#get().isGatewayModeEnabled()) {
-      this.#get().completeOperation(operationId);
-
+    if (runtimeType === 'gateway') {
       try {
+        // Pass `sendMessage` as `parentOperationId` so executeGatewayAgent
+        // completes it the instant phase-1 init finishes (after the child
+        // `execServerAgentRuntime` op starts). Without this hand-off the
+        // input loading state would drop during the execAgentTask round-trip
+        // and the send button would flicker back to "send".
         const result = await this.#get().executeGatewayAgent({
           context: operationContext,
           fileIds: fileIdList,
           message,
+          metadata: requestMetadata,
+          parentOperationId: operationId,
         });
 
         return {
@@ -548,6 +677,12 @@ export class ConversationLifecycleActionImpl {
           userMessageId: result.userMessageId,
         };
       } catch (e) {
+        // User cancelled during phase-1 init — `cancelOperation` already set
+        // the op to 'cancelled' and `executeGatewayAgent` cleaned up the
+        // server task. Don't clobber that with 'failed'.
+        const op = this.#get().operations[operationId];
+        if (op?.status === 'cancelled') return;
+
         console.error('[Gateway] Failed to start server-side agent:', e);
         this.#get().failOperation(operationId, {
           message: e instanceof Error ? e.message : 'Unknown error',
@@ -589,6 +724,7 @@ export class ConversationLifecycleActionImpl {
       const toolContext = formatSelectedToolsContext(dedupedTools);
       const contextSuffix = [skillContext, toolContext].filter(Boolean).join('\n');
       const persistedContent = contextSuffix ? `${message}\n\n${contextSuffix}` : message;
+      const newTopicTitle = message.slice(0, 80) || t('defaultTitle', { ns: 'topic' });
 
       data = await aiChatService.sendMessageInServer(
         {
@@ -596,12 +732,18 @@ export class ConversationLifecycleActionImpl {
             content: persistedContent,
             editorData,
             files: fileIdList,
+            metadata: userMessageMetadata,
             pageSelections,
             parentId,
           },
           preloadMessages: undefined,
           // if there is topicId, then add topicId to message
           topicId: topicId ?? undefined,
+          topicFilter: this.#getTopicFilter(
+            operationContext.agentId,
+            operationContext.groupId ?? undefined,
+          ),
+          topicPageSize: systemStatusSelectors.topicPageSize(useGlobalStore.getState()),
           threadId: operationContext.threadId ?? undefined,
           // Support creating new thread along with message
           newThread: newThread
@@ -613,8 +755,7 @@ export class ConversationLifecycleActionImpl {
           newTopic: !topicId
             ? {
                 topicMessageIds: forceNewTopicFromExisting ? [] : messages.map((m) => m.id),
-                title: message.slice(0, 20) || t('defaultTitle', { ns: 'topic' }),
-                trigger: context.topicTrigger,
+                title: newTopicTitle,
               }
             : undefined,
           agentId: operationContext.agentId,
@@ -630,7 +771,7 @@ export class ConversationLifecycleActionImpl {
         abortController,
       );
       // Use created topicId/threadId if available, otherwise use original from context
-      let finalTopicId = operationContext.topicId;
+      let finalTopicId = data.topicId ?? operationContext.topicId;
       const finalThreadId = data.createdThreadId ?? operationContext.threadId;
 
       // refresh the total data
@@ -653,6 +794,18 @@ export class ConversationLifecycleActionImpl {
           // Record the created topicId in metadata (not context)
           this.#get().updateOperationMetadata(operationId, { createdTopicId: data.topicId });
         }
+      } else if (data.isCreateNewTopic && data.topicId && !context.isolatedTopic) {
+        this.#get().internal_dispatchTopic(
+          {
+            type: 'addTopic',
+            value: {
+              id: data.topicId,
+              title: newTopicTitle,
+            },
+          },
+          'sendMessage/createTopicPlaceholder',
+        );
+        this.#get().updateOperationMetadata(operationId, { createdTopicId: data.topicId });
       } else if (operationContext.topicId) {
         // Optimistically update topic's updatedAt so sidebar re-groups immediately
         this.#get().internal_dispatchTopic({
@@ -666,9 +819,18 @@ export class ConversationLifecycleActionImpl {
       if (data.createdThreadId) {
         this.#get().updateOperationMetadata(operationId, { createdThreadId: data.createdThreadId });
 
-        // Update portalThreadId to switch from "new thread" mode to "existing thread" mode
-        // This ensures the Portal Thread UI displays correctly with the real thread ID
-        this.#get().openThreadInPortal(data.createdThreadId, context.sourceMessageId);
+        // When the active portal view is already the Thread surface (the
+        // main-page "create subtopic" flow staged it before sending), pivot it
+        // from `isNew` → persisted thread id. Otherwise the thread was started
+        // by a panel-hosted ConversationProvider (e.g. FloatingChatPanel inside
+        // the Document portal) and we must NOT push a Thread view — doing so
+        // would cover the host view the user is still reading.
+        const currentPortalViewType = chatPortalSelectors.currentViewType(this.#get());
+        if (currentPortalViewType === PortalViewType.Thread) {
+          this.#get().openThreadInPortal(data.createdThreadId, context.sourceMessageId);
+        } else {
+          this.#get().syncThreadInPortal(data.createdThreadId, context.sourceMessageId);
+        }
 
         // Refresh threads list to update the sidebar
         this.#get().refreshThreads();
@@ -676,6 +838,15 @@ export class ConversationLifecycleActionImpl {
 
       // Create final context with updated topicId/threadId from server response
       const finalContext = { ...operationContext, topicId: finalTopicId, threadId: finalThreadId };
+      data = {
+        ...data,
+        messages: attachSendTimeMetadataToUserMessage(
+          data.messages,
+          data.userMessageId,
+          userMessageMetadata,
+        ),
+      };
+
       this.#get().replaceMessages(data.messages, {
         context: finalContext,
         action: 'sendMessage/serverResponse',
@@ -741,9 +912,7 @@ export class ConversationLifecycleActionImpl {
     // Dev-only fast path: fall back to slicing the first user message instead of calling
     // the LLM. Keeps chat logs uncluttered while still giving the topic a usable title.
     // Only honored in non-production builds so a misconfigured prod env can't disable it.
-    const shouldSliceTopicTitle =
-      process.env.NODE_ENV !== 'production' &&
-      process.env.NEXT_PUBLIC_DEV_DISABLE_AUTO_TOPIC === '1';
+    const shouldSliceTopicTitle = __DEV__ && process.env.NEXT_PUBLIC_DEV_DISABLE_AUTO_TOPIC === '1';
 
     const applyTopicTitle = async (topicId: string, messages: UIChatMessage[]) => {
       if (!shouldSliceTopicTitle) {
@@ -752,7 +921,7 @@ export class ConversationLifecycleActionImpl {
       }
 
       const firstUserText = messages.find((m) => m.role === 'user')?.content?.trim() ?? '';
-      const title = firstUserText.slice(0, 30) || 'New Topic';
+      const title = markdownToTxt(firstUserText).slice(0, 80) || 'New Topic';
       await this.#get().internal_updateTopic(topicId, { title });
       // summaryTopicTitle would normally clear loading via onLoadingChange; do it manually.
       this.#get().internal_updateTopicLoading(topicId, false);
@@ -837,48 +1006,60 @@ export class ConversationLifecycleActionImpl {
 
     // ── AI execution (client mode) ──
     {
-      const displayMessages = displayMessageSelectors.getDisplayMessagesByKey(
-        messageMapKey(execContext),
-      )(this.#get());
-
       try {
-        // When agents are @mentioned, inject a slim callAgent-only manifest
-        // so the AI can delegate directly without activating the full agent-management tool
-        const injectedManifests = hasMentionedAgents ? [createCallAgentManifest()] : undefined;
-        const activeTopicDocumentInitialContext =
-          await resolveActiveTopicDocumentInitialContext(execContext);
+        if (directMentionRoute) {
+          await this.#executeDirectMentionRoute({
+            assistantMessageId: data.assistantMessageId,
+            context: execContext,
+            directMentionRoute,
+            inPortalThread: !!data.createdThreadId,
+            instruction: message,
+            parentOperationId: operationId,
+          });
+        } else {
+          const displayMessages = displayMessageSelectors.getDisplayMessagesByKey(
+            messageMapKey(execContext),
+          )(this.#get());
 
-        const hasInitialContext = hasMentionedAgents || !!injectedManifests;
+          // When agents are @mentioned, inject a slim callAgent-only manifest
+          // so the AI can delegate directly without activating the full agent-management tool
+          const injectedManifests = hasMentionedAgents ? [createCallAgentManifest()] : undefined;
+          const activeTopicDocumentInitialContext =
+            await resolveActiveTopicDocumentInitialContext(execContext);
 
-        // Note: selectedSkills and selectedTools are NOT passed here — they are
-        // persisted into the user message content above so they survive across
-        // turns without re-injection.
-        const agentRuntimeInitialContext = hasInitialContext
-          ? {
-              initialContext: {
-                // Only inject mentionedAgents in non-group context to avoid
-                // group @member mentions (including ALL_MEMBERS) leaking into agent-management
-                ...(hasMentionedAgents ? { mentionedAgents } : undefined),
-                ...(injectedManifests ? { injectedManifests } : undefined),
-              },
-              phase: 'init' as const,
-            }
-          : undefined;
-        const mergedAgentRuntimeInitialContext = mergeAgentRuntimeInitialContexts(
-          activeTopicDocumentInitialContext,
-          agentRuntimeInitialContext,
-        );
+          const hasInitialContext = hasMentionedAgents || !!injectedManifests;
 
-        await internal_execAgentRuntime({
-          context: execContext,
-          initialContext: mergedAgentRuntimeInitialContext,
-          messages: displayMessages,
-          parentMessageId: data.assistantMessageId,
-          parentMessageType: 'assistant',
-          parentOperationId: operationId,
-          inPortalThread: !!data.createdThreadId,
-          skipCreateFirstMessage: true,
-        });
+          // Note: selectedSkills and selectedTools are NOT passed here — they are
+          // persisted into the user message content above so they survive across
+          // turns without re-injection.
+          const agentRuntimeInitialContext = hasInitialContext
+            ? {
+                initialContext: {
+                  // Only inject mentionedAgents in non-group context to avoid
+                  // group @member mentions (including ALL_MEMBERS) leaking into agent-management
+                  ...(hasMentionedAgents ? { mentionedAgents } : undefined),
+                  ...(injectedManifests ? { injectedManifests } : undefined),
+                },
+                phase: 'init' as const,
+              }
+            : undefined;
+          const mergedAgentRuntimeInitialContext = mergeAgentRuntimeInitialContexts(
+            activeTopicDocumentInitialContext,
+            agentRuntimeInitialContext,
+          );
+
+          await executeClientAgent({
+            context: execContext,
+            initialContext: mergedAgentRuntimeInitialContext,
+            metadata: requestMetadata,
+            messages: displayMessages,
+            parentMessageId: data.assistantMessageId,
+            parentMessageType: 'assistant',
+            parentOperationId: operationId,
+            inPortalThread: !!data.createdThreadId,
+            skipCreateFirstMessage: true,
+          });
+        }
 
         const userFiles = dbMessageSelectors
           .dbUserFiles(this.#get())
@@ -904,46 +1085,164 @@ export class ConversationLifecycleActionImpl {
     };
   };
 
-  continueGenerationMessage = async (id: string, messageId: string): Promise<void> => {
-    const message = dbMessageSelectors.getDbMessageById(id)(this.#get());
-    if (!message) return;
-
-    const { activeAgentId, activeTopicId, activeThreadId, activeGroupId } = this.#get();
-
-    // Create base context for continue operation (using global state)
-    const continueContext = {
-      agentId: activeAgentId,
-      topicId: activeTopicId,
-      threadId: activeThreadId ?? undefined,
-      groupId: activeGroupId,
+  async #executeDirectMentionRoute({
+    assistantMessageId,
+    context,
+    inPortalThread,
+    directMentionRoute,
+    instruction,
+    parentOperationId,
+  }: {
+    assistantMessageId: string;
+    context: ConversationContext;
+    inPortalThread?: boolean;
+    directMentionRoute: SingleAgentMentionDirectRoute;
+    instruction: string;
+    parentOperationId: string;
+  }): Promise<void> {
+    const targetAgentId = directMentionRoute.agent.id;
+    const callAgentParams: CallAgentParams = {
+      agentId: targetAgentId,
+      instruction,
     };
+    const toolPayload: ChatToolPayload = {
+      apiName: AgentManagementApiName.callAgent,
+      arguments: JSON.stringify(callAgentParams),
+      id: `call_agent_${nanoid()}`,
+      identifier: AgentManagementIdentifier,
+      source: 'builtin',
+      type: 'builtin',
+    };
+    const callAgentState: CallAgentState = {
+      agentId: targetAgentId,
+      instruction,
+      mode: 'speak',
+    };
+    const toolResultContent = `Called agent "${targetAgentId}" to respond.`;
 
-    // Create continue operation
     const { operationId } = this.#get().startOperation({
-      type: 'continue',
-      context: { ...continueContext, messageId },
+      context: { ...context, messageId: assistantMessageId },
+      label: 'Direct Agent Mention',
+      metadata: {
+        apiName: AgentManagementApiName.callAgent,
+        targetAgentId,
+        tool_call_id: toolPayload.id,
+      },
+      parentOperationId,
+      type: 'toolCalling',
     });
 
     try {
-      const chats = displayMessageSelectors.mainAIChatsWithHistoryConfig(this.#get());
+      this.#get().internal_dispatchMessage(
+        {
+          id: assistantMessageId,
+          type: 'updateMessage',
+          value: { content: '' },
+        },
+        { operationId },
+      );
+      await this.#get().optimisticUpdateMessageContent(
+        assistantMessageId,
+        '',
+        { tools: [toolPayload] },
+        { operationId },
+      );
 
-      await this.#get().internal_execAgentRuntime({
-        context: continueContext,
-        messages: chats,
-        parentMessageId: id,
-        parentMessageType: message.role as 'assistant' | 'tool' | 'user',
-        parentOperationId: operationId,
-      });
+      const toolMessage = await this.#get().optimisticCreateMessage(
+        {
+          agentId: context.agentId!,
+          content: toolResultContent,
+          groupId: context.groupId,
+          parentId: assistantMessageId,
+          plugin: toolPayload,
+          pluginState: callAgentState,
+          role: 'tool',
+          threadId: context.threadId,
+          tool_call_id: toolPayload.id,
+          topicId: context.topicId ?? undefined,
+        },
+        { operationId },
+      );
+
+      if (!toolMessage) {
+        throw new Error(
+          `[directMentionRoute] Failed to create callAgent tool message for agentId: ${targetAgentId}`,
+        );
+      }
+
+      const preloadError = await this.#preloadDirectMentionAgentConfig(targetAgentId);
+      if (preloadError) {
+        await this.#get().optimisticUpdateMessageContent(toolMessage.id, preloadError, undefined, {
+          operationId,
+        });
+        this.#get().completeOperation(operationId);
+        return;
+      }
+
+      const currentMessages = dbMessageSelectors.getDbMessagesByKey(messageMapKey(context))(
+        this.#get(),
+      );
+      const trimmedInstruction = instruction.trim();
+      const now = Date.now();
+      const messagesWithInstruction = trimmedInstruction
+        ? [
+            ...currentMessages,
+            {
+              content: `<speaker name="Supervisor" />\n${instruction}`,
+              createdAt: now,
+              id: `virtual_speak_instruction_${now}`,
+              role: 'user' as const,
+              updatedAt: now,
+            },
+          ]
+        : currentMessages;
+
+      // Sub-agent dispatch inherits the parent's runtime selection — a
+      // gateway/hetero parent must keep its sub-agents on the same path.
+      // Runtime routing is fully delegated to dispatchNonHeteroSubAgent ().
+      const parentAgentConfig = context.agentId
+        ? agentSelectors.getAgentConfigById(context.agentId)(getAgentStoreState())
+        : undefined;
+
+      await dispatchNonHeteroSubAgent(
+        { kind: 'mention', targetAgentId, instruction, parentMessageId: toolMessage.id },
+        {
+          conversationContext: context,
+          heterogeneousProvider: parentAgentConfig?.agencyConfig?.heterogeneousProvider,
+          inPortalThread,
+          isGatewayMode: this.#get().isGatewayModeEnabled(),
+          messages: messagesWithInstruction,
+          parentOperationId: operationId,
+        },
+        this.#get(),
+      );
 
       this.#get().completeOperation(operationId);
     } catch (error) {
       this.#get().failOperation(operationId, {
-        type: 'ContinueError',
+        type: 'DirectMentionRouteError',
         message: error instanceof Error ? error.message : String(error),
       });
       throw error;
     }
-  };
+  }
+
+  async #preloadDirectMentionAgentConfig(agentId: string): Promise<string | undefined> {
+    const targetAgentExists = useAgentStore.getState().agentMap[agentId];
+    if (targetAgentExists) return;
+
+    try {
+      const config = await agentService.getAgentConfigById(agentId);
+      if (!config) {
+        return `Agent "${agentId}" not found in your workspace. Please check the agent ID and try again.`;
+      }
+
+      useAgentStore.getState().internal_dispatchAgentMap(agentId, config);
+    } catch (error) {
+      console.error('[directMentionRoute] Failed to load agent config:', error);
+      return `Failed to load agent "${agentId}": ${(error as Error).message}`;
+    }
+  }
 
   /**
    * Execute context compression for /compact command.
